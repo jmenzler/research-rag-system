@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+/*
+ * Phase 3.5 retrofit — the shadcn-slate token layer is remapped onto the p3
+ * neutral-slate palette so every `components/ui` element + the chat surface
+ * retints to the same deep-slate look as the Corpus / Queries (.p3) surfaces.
+ * The p3 hex values from src/styles/phase3.css are expressed as full hsl()
+ * colors directly inside @theme so Tailwind v4 composes opacity modifiers
+ * (bg-muted/40, hover:bg-primary/90, ring-ring/50) via color-mix.
+ *
+ * The app always runs in `.dark` (index.html sets it before paint), so the
+ * theme colors below ARE the dark palette. The `:root`/`.dark` base vars only
+ * back the handful of raw `var(--background)` consumers (body, etc.).
+ *
+ * Hex → HSL: bg #11151E · surface #181D29 · surface-2 #1F2536 ·
+ *   border #252C3F · fg #E8EDF5 · fg-2 #C5CFE0 · muted #8B98AD ·
+ *   primary #3B82F6 · err #EF4444.
+ */
+
+@theme {
+  --color-background: hsl(221.5 27.7% 9.2%); /* p3 --bg */
+  --color-foreground: hsl(216.9 39.4% 93.5%); /* p3 --fg */
+  --color-card: hsl(222.4 26.2% 12.7%); /* p3 --surface */
+  --color-card-foreground: hsl(216.9 39.4% 93.5%);
+  --color-popover: hsl(222.4 26.2% 12.7%); /* p3 --surface */
+  --color-popover-foreground: hsl(216.9 39.4% 93.5%);
+  --color-primary: hsl(221.2 83.2% 53.3%); /* blue-600 #2563EB — white-on-fill needs >=4.5:1 (blue-500 was 3.67) */
+  --color-primary-foreground: hsl(0 0% 100%);
+  --color-secondary: hsl(224.3 27.1% 16.7%); /* p3 --surface-2 */
+  --color-secondary-foreground: hsl(217.8 30.3% 82.5%); /* p3 --fg-2 */
+  --color-muted: hsl(224.3 27.1% 16.7%); /* p3 --surface-2 */
+  --color-muted-foreground: hsl(217.1 17.2% 61.2%); /* p3 --muted */
+  --color-accent: hsl(224.3 27.1% 16.7%); /* p3 --surface-2 (hover plane) */
+  --color-accent-foreground: hsl(216.9 39.4% 93.5%);
+  --color-destructive: hsl(0 84.2% 60.2%); /* p3 --err #EF4444 */
+  --color-destructive-foreground: hsl(0 0% 100%);
+  --color-border: hsl(223.8 26.0% 19.6%); /* p3 --border */
+  --color-input: hsl(223.8 26.0% 19.6%); /* p3 --border */
+  --color-ring: hsl(217.2 91.2% 59.8%); /* p3 --primary */
+  --radius: 0.5rem;
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+@layer base {
+  :root,
+  .dark {
+    --background: hsl(221.5 27.7% 9.2%);
+    --foreground: hsl(216.9 39.4% 93.5%);
+  }
+
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: "Fira Sans", -apple-system, system-ui, sans-serif;
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}

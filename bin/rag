@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# rag — query the local hybrid Milvus RAG from anywhere on the system.
+#
+# Resolves to the rag-system project directory and invokes
+# `uv run python -m src.query.generate` with the user's args.
+#
+# Examples:
+#   rag --query "What is VPIN?" --collection trading
+#   rag --query-file ./long_q.txt --collection trading --json
+#   rag --query "..." --collection trading --notebook example_notebook --raw
+
+set -euo pipefail
+
+# Locate the rag-system root (the directory containing pyproject.toml above bin/).
+# Resolve symlinks so this works when symlinked into ~/.local/bin or similar.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+PROJECT_ROOT="$(cd -P "$BIN_DIR/.." && pwd)"
+
+cd "$PROJECT_ROOT"
+exec uv run python -m src.query.generate "$@"

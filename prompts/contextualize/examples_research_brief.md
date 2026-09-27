@@ -1,0 +1,8 @@
+[chunk]: "...Recent studies suggest that LVR scales as σ²·L/2 in the small-volatility limit, with empirical estimates from Milionis et al. (2022) ranging from 5-20bps daily for ETH-USDC pools..."
+[context]: From the "Current state of LVR research" section of a synthesized research brief on AMM impermanent loss attribution. The chunk surfaces the LVR scaling law, names Milionis et al. (2022) as the canonical reference, and reports the empirical bps range observed on ETH-USDC pools — a synthesized claim aggregating multiple cited sources, not a primary result.
+
+[chunk]: "...Open questions remain about whether RAG re-rankers based on cross-encoders consistently outperform listwise LLM re-rankers under domain shift..."
+[context]: From the "Open questions" section of a research brief on production RAG re-ranking strategies. The chunk frames cross-encoder vs listwise LLM re-rankers as an unresolved comparison under domain shift, flagged as a gap rather than a settled finding — useful for framing future evaluation work, not for citing as a result.
+
+[chunk]: "...The methodology relies on six primary sources: Avellaneda & Stoikov (2008), Guéant et al. (2013), Cartea et al. (2015), Stoikov (2018), Lehalle & Mounjid (2017), and the more recent Bergault et al. (2022) extension to multi-asset inventory..."
+[context]: From the "Methodology overview" section of a research brief synthesizing the inventory-aware market making literature. The chunk lists the six anchor papers the brief draws on, spanning A-S (2008) through Bergault et al. (2022) — a roadmap citation block establishing the synthesis's source basis.

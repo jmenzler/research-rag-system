@@ -1,0 +1,56 @@
+.venv/
+.venv-mineru/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+!frontend/.env.example
+.DS_Store
+parents.sqlite
+parents/parents.sqlite
+parents/parents.db
+parents/chats.db
+parents/
+data/
+models/
+parents/*.bak-*
+sources/
+logs/
+output/
+.firecrawl/
+.claude/
+spikes/
+*.log
+
+# graphify
+graphify-out/
+.graphify/
+.worktree/
+
+# build artifacts
+rag_system.egg-info/
+
+# speckit / specify scaffolding (local tooling only)
+.specify/
+specs/
+
+
+notebooks.json
+golden/
+
+src/server/_version.py
+
+src/server/static/
+frontend/dist/
+frontend/node_modules/
+
+# Vite/Vitest caches
+frontend/.vite/
+frontend/coverage/
+
+frontend/.env.local
+frontend/.env.*.local

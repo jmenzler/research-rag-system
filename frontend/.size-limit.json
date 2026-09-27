@@ -1,0 +1,20 @@
+[
+  {
+    "name": "initial (chat)",
+    "path": "dist/assets/index-*.js",
+    "limit": "205 kB",
+    "gzip": true
+  },
+  {
+    "name": "graph-viz chunk",
+    "path": "dist/assets/graph-viz-*.js",
+    "limit": "250 kB",
+    "gzip": true
+  },
+  {
+    "name": "markdown chunk",
+    "path": "dist/assets/markdown-*.js",
+    "limit": "105 kB",
+    "gzip": true
+  }
+]

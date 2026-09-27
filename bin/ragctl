@@ -1,0 +1,978 @@
+#!/usr/bin/env -S uv run python
+"""ragctl — single-entry CLI to manage the local hybrid Milvus RAG.
+
+Subcommands cover the full lifecycle: fetch → parse → audit → contextualize →
+ingest → query, plus inspection commands (status, quarantine).
+
+Every subcommand supports `--json` for machine-readable output (LLM-friendly).
+
+Usage:
+    ragctl status [--json]
+    ragctl run --collection <coll> [--notebooks <UUID>+] [--stages ...]
+    ragctl audit [--json]                         # corpus-wide audit + manifest
+    ragctl apply [--dry-run]                      # apply cleanup manifest
+    ragctl query "<text>" [--notebook X] [--json]
+    ragctl quarantine list [--json]
+    ragctl quarantine restore <path>
+
+The on-disk archive lives at ``sources/<collection>/<slug>/``. There is no
+notebook-level addressability after fetch; once a doc lands in the archive
+its NLM UUID is a discardable batch handle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.pipeline import orchestrate  # noqa: E402
+
+
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Run a subprocess with the project root as CWD. Streams to terminal by default."""
+    return subprocess.run(cmd, cwd=ROOT, check=False, **kw)
+
+
+# ---------------------------------------------------------------------------
+# Memory cgroup self-bound for `ragctl run`
+# ---------------------------------------------------------------------------
+#
+# Bound parser memory so a failed parse cannot exhaust the whole host.
+#
+# Eligibility (all required):
+#   - subcommand == "run"
+#   - not --dry-run (no need to bound a no-op)
+#   - not --unbounded (escape hatch, e.g. CI without sudo)
+#   - Linux (Mac dev path runs other subcommands inline)
+#   - not already inside a memory-limited cgroup
+#   - systemd-run + sudo available
+#
+# Tunable via env: RAG_MEM_HIGH (default 24G), RAG_MEM_MAX (default 28G).
+
+_RAG_BOUND_ENV = "RAG_BOUNDED"   # sentinel set when re-exec'd, prevents recursion
+_RAG_MEM_HIGH = os.environ.get("RAG_MEM_HIGH", "24G")
+_RAG_MEM_MAX = os.environ.get("RAG_MEM_MAX", "28G")
+
+
+def _already_bounded() -> bool:
+    """True if our current cgroup already has a finite memory.max.
+
+    Prevents recursion when re-exec'd inside the scope (sentinel env var
+    is the primary guard; this is defence in depth for the case where the
+    env got stripped but we're definitely under a limit already).
+    """
+    try:
+        cg_line = Path("/proc/self/cgroup").read_text().strip()
+        cg_path = cg_line.split(":")[-1]
+        max_file = Path(f"/sys/fs/cgroup{cg_path}/memory.max")
+        if not max_file.exists():
+            return False
+        return max_file.read_text().strip() != "max"
+    except OSError:
+        return False
+
+
+def _maybe_reexec_bounded(argv: list[str]) -> None:
+    """If `argv` is a `ragctl run` invocation that should be cgroup-bounded,
+    re-exec self under sudo systemd-run --scope and never return.
+
+    Returns (does nothing) when not eligible.
+    """
+    if os.environ.get(_RAG_BOUND_ENV) == "1":
+        return                                    # already inside the scope
+    if len(argv) < 2 or argv[1] != "run":
+        return                                    # only `run` is bounded
+    if "--dry-run" in argv or "--unbounded" in argv:
+        return
+    if sys.platform != "linux":
+        return                                    # Mac dev / CI macOS
+    if _already_bounded():
+        return
+    if shutil.which("systemd-run") is None or shutil.which("sudo") is None:
+        return
+
+    # Strip --unbounded if present (it isn't, given the check above, but
+    # keep argv clean) and re-exec under the scope.
+    inner = [a for a in argv if a != "--unbounded"]
+    user = os.environ.get("USER") or str(os.getuid())
+    home = os.environ.get("HOME", "")
+    path = os.environ.get("PATH", "")
+    # Ensure ~/.local/bin (uv) resolves under the scope's reset PATH.
+    if home and f"{home}/.local/bin" not in path.split(":"):
+        path = f"{home}/.local/bin:{path}"
+    cmd = [
+        "sudo", "systemd-run", "--scope", "--quiet",
+        f"-pMemoryHigh={_RAG_MEM_HIGH}",
+        f"-pMemoryMax={_RAG_MEM_MAX}",
+        "-pMemorySwapMax=infinity",
+        f"--uid={user}",
+        f"--working-directory={Path.cwd()}",
+        f"--setenv={_RAG_BOUND_ENV}=1",
+        f"--setenv=HOME={home}",
+        f"--setenv=PATH={path}",
+        *inner,
+    ]
+    print(
+        f"ragctl: re-exec under cgroup (MemoryHigh={_RAG_MEM_HIGH}, "
+        f"MemoryMax={_RAG_MEM_MAX}); pass --unbounded to disable",
+        file=sys.stderr,
+    )
+    os.execvp(cmd[0], cmd)
+
+
+def _emit(data: dict, as_json: bool, lines: list[str] | None = None) -> None:
+    """Print machine-readable JSON or human-friendly text per --json flag."""
+    if as_json:
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        if lines:
+            for line in lines:
+                print(line)
+        else:
+            for k, v in data.items():
+                print(f"{k}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# status — corpus + milvus snapshot
+# ---------------------------------------------------------------------------
+def cmd_status(args: argparse.Namespace) -> int:
+    sources = ROOT / "sources"
+    docs_per_collection: dict[str, int] = {}
+    if sources.exists():
+        for coll_dir in sorted(sources.iterdir()):
+            if not coll_dir.is_dir() or coll_dir.name.startswith("_"):
+                continue
+            docs_per_collection[coll_dir.name] = sum(
+                1 for d in coll_dir.iterdir()
+                if d.is_dir() and not d.name.startswith("_")
+            )
+    n_quarantine_p = (
+        sum(1 for _ in (sources / "_quarantine_poisoned").rglob("*.txt"))
+        if sources.exists() else 0
+    )
+    n_quarantine_d = (
+        sum(1 for _ in (sources / "_quarantine_dupes").rglob("*.txt"))
+        if sources.exists() else 0
+    )
+    n_sidecars = sum(1 for _ in sources.rglob("*.ctx.json")) if sources.exists() else 0
+
+    milvus: dict = {}
+    try:
+        from src.milvus_client import get_client  # noqa: PLC0415
+
+        client = get_client()
+        for name in client.list_collections():
+            stats = client.get_collection_stats(collection_name=name)
+            milvus[name] = {"entities": int(stats.get("row_count", 0))}
+    except Exception as e:
+        milvus = {"error": f"{type(e).__name__}: {e}"}
+
+    data = {
+        "docs_per_collection": docs_per_collection,
+        "docs_total": sum(docs_per_collection.values()),
+        "quarantine_poisoned": n_quarantine_p,
+        "quarantine_dupes": n_quarantine_d,
+        "context_sidecars": n_sidecars,
+        "milvus": milvus,
+    }
+
+    if args.json:
+        _emit(data, True)
+    else:
+        print("=== RAG corpus status ===")
+        print(f"  collections: {len(docs_per_collection)} "
+              f"({sum(docs_per_collection.values())} doc dirs)")
+        for coll, n in sorted(docs_per_collection.items(), key=lambda x: -x[1]):
+            print(f"    {coll:<28} {n:>5d}")
+        print(f"  quarantine_poisoned: {n_quarantine_p}")
+        print(f"  quarantine_dupes:    {n_quarantine_d}")
+        print(f"  context sidecars:    {n_sidecars}")
+        print()
+        print("=== Milvus ===")
+        for k, v in milvus.items():
+            print(f"  {k}: {v}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# audit / apply
+# ---------------------------------------------------------------------------
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Run filename-content + cross-partition dedup audits, then build manifest."""
+    for mod in ["src.cleanup.filename_content_match_audit", "src.cleanup.cross_partition_dedup_audit", "src.cleanup.build_cleanup_manifest"]:
+        result = _run(["uv", "run", "python", "-m", mod],
+                      capture_output=args.json)
+        if result.returncode != 0:
+            return result.returncode
+
+    manifest_path = ROOT / "logs" / "cleanup_manifest.json"
+    if not manifest_path.exists():
+        return 1
+    manifest = json.loads(manifest_path.read_text())
+
+    if args.json:
+        _emit({"summary": manifest["summary"]}, True)
+    else:
+        s = manifest["summary"]
+        print(f"\n=== cleanup manifest ({manifest_path.name}) ===")
+        print(f"  poisoned:   {s['n_quarantine_poisoned']}")
+        print(f"  dupes:      {s['n_quarantine_dupes']}")
+        print(f"  canonicals: {s['n_canonical_groups']}")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    cmd = ["uv", "run", "python", "-m", "src.cleanup.apply_cleanup_manifest"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    return _run(cmd).returncode
+
+
+# ---------------------------------------------------------------------------
+# quarantine
+# ---------------------------------------------------------------------------
+def cmd_quarantine_list(args: argparse.Namespace) -> int:
+    from src.pipeline.quarantine import list_quarantined  # noqa: PLC0415
+
+    pois = sorted((ROOT / "sources" / "_quarantine_poisoned").rglob("*.txt"))
+    dupes = sorted((ROOT / "sources" / "_quarantine_dupes").rglob("*.txt"))
+    crashers = list_quarantined(ROOT / "sources")
+
+    data = {
+        "poisoned": [str(p.relative_to(ROOT)) for p in pois],
+        "dupes": [str(p.relative_to(ROOT)) for p in dupes],
+        "crashers": crashers,
+        "totals": {
+            "poisoned": len(pois),
+            "dupes": len(dupes),
+            "crashers": len(crashers),
+        },
+    }
+    if args.json:
+        _emit(data, True)
+    else:
+        print(f"=== quarantine_poisoned ({len(pois)}) ===")
+        for p in pois:
+            print(f"  {p.relative_to(ROOT)}")
+        print(f"\n=== quarantine_dupes ({len(dupes)}) ===")
+        for p in dupes:
+            print(f"  {p.relative_to(ROOT)}")
+        print(f"\n=== _quarantine (crashers) ({len(crashers)}) ===")
+        for r in crashers:
+            reason = r.get("reason", "?")
+            deaths = r.get("deaths_observed", "?")
+            ts = r.get("quarantined_at", "")
+            print(f"  {r['collection']}/{r['slug']}  "
+                  f"reason={reason} deaths={deaths} at={ts}")
+    return 0
+
+
+def cmd_quarantine_show(args: argparse.Namespace) -> int:
+    """Print the sidecar contents for one quarantined slug."""
+    from src.pipeline.quarantine import list_quarantined  # noqa: PLC0415
+
+    rows = list_quarantined(ROOT / "sources")
+    match = next(
+        (r for r in rows
+         if r["collection"] == args.collection and r["slug"] == args.slug),
+        None,
+    )
+    if match is None:
+        print(
+            f"not under crasher quarantine: {args.collection}/{args.slug}",
+            file=sys.stderr,
+        )
+        return 1
+    _emit(match, True)
+    return 0
+
+
+def cmd_quarantine_unquarantine(args: argparse.Namespace) -> int:
+    """Move a crasher-quarantined slug back to active sources."""
+    from src.pipeline.quarantine import unquarantine_source  # noqa: PLC0415
+
+    try:
+        target = unquarantine_source(
+            sources_root=ROOT / "sources",
+            collection=args.collection,
+            slug=args.slug,
+        )
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"unquarantined: {target.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_quarantine_restore(args: argparse.Namespace) -> int:
+    """Move a quarantined file back into its collection dir (reverses one apply).
+
+    The expected path layout is
+    ``sources/_quarantine_{poisoned,dupes}/<collection>/<slug>/<leaf>``;
+    the file is restored to ``sources/<collection>/<slug>/<leaf>``.
+    """
+    p = Path(args.path)
+    if not p.is_absolute():
+        p = ROOT / p
+    if not p.exists():
+        print(f"not found: {p}", file=sys.stderr)
+        return 1
+    parts = p.relative_to(ROOT / "sources").parts
+    if len(parts) < 3 or parts[0] not in ("_quarantine_poisoned", "_quarantine_dupes"):
+        print(f"not in a quarantine bucket: {p}", file=sys.stderr)
+        return 1
+    target = ROOT / "sources" / parts[1] / "/".join(parts[2:])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    p.rename(target)
+    print(f"restored: {target.relative_to(ROOT)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# help — rich LLM-friendly system guide
+# ---------------------------------------------------------------------------
+LLM_GUIDE: dict = {
+    "system": "Local hybrid Milvus RAG. Replaces NotebookLM with private CLI-queryable vector store.",
+    "data_flow": [
+        "NotebookLM UUID → src.fetch.cli → sources/<collection>/<slug>/{nlm,pdf,web}.txt + source.pdf + figures/",
+        "src.pdf_parsers.cli → pdf.txt + content_list.json next to each source.pdf",
+        "audit (filename↔content + cross-collection dedup) → logs/cleanup_manifest.json",
+        "apply manifest → poisoned/dupes moved to sources/_quarantine_*/",
+        "contextualize → <leaf>.txt.ctx.json sidecar next to each source text (Anthropic Contextual Retrieval)",
+        "ingest → chunks read sidecar, prepend context, embed via Qwen3-Embedding-8b (4096d), store in Milvus",
+    ],
+    "key_paths": {
+        "doc_dirs":         "sources/<collection>/<slug>/{source.pdf, pdf.txt, nlm.txt, web.txt, content_list.json, meta.json}",
+        "quarantined":      "sources/_quarantine_{poisoned,dupes}/<collection>/<slug>/...",
+        "context_sidecars": "sources/<collection>/<slug>/*.txt.ctx.json",
+        "audit_outputs":    "logs/{filename_content_match,cross_partition_dedup,cleanup_manifest}.json",
+        "ingest_state":     "parents/parents.db (sqlite — parent chunks + ingest dedup)",
+    },
+    "commands": {
+        "status":          "corpus + Milvus snapshot. Always start here.",
+        "run":             "ragctl run --collection <COLL> [--notebooks <UUID>+] — full pipeline.",
+        "audit":           "run all 3 audits + build cleanup manifest. Corpus-wide. ~30s.",
+        "apply":           "move quarantined files. Use --dry-run first.",
+        "query 'text'":    "proxy to bin/rag. Returns answer + citations + chunks.",
+        "quarantine list": "show quarantined files.",
+        "quarantine restore PATH": "move one file back into its collection dir.",
+    },
+    "json_flag": "Use --json on status, audit, query, quarantine list for machine-readable output.",
+    "common_workflows": {
+        "fetch_new_sources_into_collection": [
+            "ragctl run --collection trading --notebooks <UUID1> <UUID2>",
+        ],
+        "reingest_collection_after_chunker_change": [
+            "ragctl run --collection trading --skip-stages fetch parse_pipeline parse_vlm",
+        ],
+        "investigate_quarantined": [
+            "ragctl quarantine list --json",
+            "ragctl quarantine restore sources/_quarantine_poisoned/...",
+            "ragctl audit",
+        ],
+        "query_corpus": [
+            "ragctl query 'GLFT kappa calibration' --notebook trading --json",
+        ],
+    },
+    "rules_quarantine": {
+        "fail_page": "literal token (Cloudflare/404) OR longest paragraph < 70 chars in first 1500 chars",
+        "rule_1_canonical": "hash collision: pick filename whose tokens best match content's first 5KB. If best<0.4, ALL copies poisoned.",
+        "rule_6_combiner": "name_mismatch only escalates when paired with: hash collision OR file<1KB OR longest_paragraph<70",
+        "tunable_in":     "src/cleanup/quality.py (MIN_LONGEST_PARAGRAPH=70, MIN_TEXT_LEN=400)",
+    },
+    "extraction_retry_chain": [
+        "trafilatura(default UA) → trafilatura(browser UA)",
+        "in-page PDF discovery: arxiv ID regex first, then <a href='*.pdf'>",
+        "if pdf_bin discovered: download, parallel Docling pass extracts body",
+        "curl_cffi (Chrome TLS impersonation) escalation by default; pass --no-cffi to disable",
+    ],
+    "models": {
+        "embedding":       "gemini-embedding-2 @ 3072d native (BEIR leader, no MRL truncation)",
+        "generation":      "gemini-3-flash-preview (default) / gemini-3.1-pro-preview (quality)",
+        "judge_eval":      "gemini-2.5-flash (RAGAS evaluator)",
+        "contextualize":   "gemini-2.5-flash-lite (21/21 reliable in session 5; 1M ctx; 90% cache discount)",
+        "reranker_local":  "BAAI/bge-reranker-v2-m3 on MPS",
+    },
+    "config_files": {
+        "src/config.py":   "model names, embed dim, top-k, thresholds, RAGAS gates",
+        "src/cleanup/":    "fail-page sigs, quality gates, filename match, manifest builder, retry chain",
+        "CLAUDE.md":       "notebook tag → id mapping table; architectural constants",
+    },
+}
+
+
+def cmd_help(args: argparse.Namespace) -> int:
+    """Comprehensive system guide for LLMs and humans."""
+    if args.json:
+        _emit(LLM_GUIDE, True)
+        return 0
+    print("=== ragctl — local hybrid Milvus RAG management CLI ===\n")
+    print(LLM_GUIDE["system"], "\n")
+    print("DATA FLOW")
+    for step in LLM_GUIDE["data_flow"]:
+        print(f"  • {step}")
+    print()
+    print("KEY PATHS")
+    for k, v in LLM_GUIDE["key_paths"].items():
+        print(f"  {k:<18} {v}")
+    print()
+    print("COMMANDS")
+    for k, v in LLM_GUIDE["commands"].items():
+        print(f"  {k:<26} {v}")
+    print()
+    print("LLM-FRIENDLY OUTPUT")
+    print(f"  {LLM_GUIDE['json_flag']}")
+    print()
+    print("COMMON WORKFLOWS")
+    for name, steps in LLM_GUIDE["common_workflows"].items():
+        print(f"  [{name}]")
+        for s in steps:
+            print(f"    $ {s}")
+        print()
+    print("QUARANTINE RULES (algorithmic, no LLM)")
+    for k, v in LLM_GUIDE["rules_quarantine"].items():
+        print(f"  {k:<18} {v}")
+    print()
+    print("EXTRACTION RETRY CHAIN")
+    for s in LLM_GUIDE["extraction_retry_chain"]:
+        print(f"  • {s}")
+    print()
+    print("MODELS")
+    for k, v in LLM_GUIDE["models"].items():
+        print(f"  {k:<18} {v}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# query (proxy to bin/rag)
+# ---------------------------------------------------------------------------
+def cmd_query(args: argparse.Namespace) -> int:
+    cmd = [str(ROOT / "bin" / "rag"), args.query]
+    if args.notebook:
+        cmd += ["--notebook", args.notebook]
+    if args.json:
+        cmd.append("--json")
+    return _run(cmd).returncode
+
+
+def cmd_ingest_deep_research(args: argparse.Namespace) -> int:
+    """Stage + ingest a NotebookLM Deep Research brief. See scripts/ingest_deep_research.py."""
+    cmd = [
+        "uv", "run", "python", "-m", "scripts.ingest_deep_research",
+        str(args.brief),
+        "--query", args.query,
+        "--notebook", args.notebook,
+        "--collection", args.collection,
+    ]
+    return _run(cmd).returncode
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """Discover sources via NotebookLM Deep Research → ingest → delete notebook.
+
+    Thin proxy. See scripts/discover_via_deep_research.py for the full flow.
+    """
+    cmd = [
+        "uv", "run", "python", "-m", "scripts.discover_via_deep_research",
+        "--query", args.query,
+        "--collection", args.collection,
+        "--mode", args.mode,
+        "--timeout", str(args.timeout),
+    ]
+    if args.keep:
+        cmd.append("--keep")
+    return _run(cmd).returncode
+
+
+def _positive_int(s: str) -> int:
+    n = int(s)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
+# ---------------------------------------------------------------------------
+# ingest-urls — fetch + ingest from an explicit URL list (non-NotebookLM path)
+# ---------------------------------------------------------------------------
+def cmd_ingest_urls(args: argparse.Namespace) -> int:
+    """Fetch a hand-curated URL list, then parse + contextualize + ingest.
+
+    Stage 1 (fetch) delegates to ``src.fetch.from_urls``. Stage 2+ runs
+    per-doc directly against the URL-scoped doc dirs returned by fetch —
+    bypasses ``run_pipeline`` to avoid the collection-wide doc enumeration
+    that ``run_pipeline`` performs in parse-only mode. Audit (corpus-wide
+    barrier) is intentionally skipped; run ``ragctl audit && ragctl apply``
+    separately if cross-collection dedup is needed.
+    """
+    from src.fetch.from_urls import fetch_from_url_file  # noqa: PLC0415
+
+    rc, fetched_dirs = fetch_from_url_file(args.urls, args.collection, args.notebook)
+    if rc != 0:
+        return rc
+    if not fetched_dirs:
+        print("No doc dirs to process.")
+        return 0
+
+    if args.dry_run:
+        print(f"[dry-run] would process {len(fetched_dirs)} doc dirs:")
+        for d in fetched_dirs:
+            print(f"  {d}")
+        return 0
+
+    from src.pipeline.runner import (  # noqa: PLC0415
+        RunLockHeldError,
+        _acquire_run_lock,
+        _release_run_lock,
+    )
+
+    try:
+        run_lock_fd = _acquire_run_lock()
+    except RunLockHeldError as exc:
+        print(f"REFUSING TO RUN: {exc}")
+        return 2
+    atexit_register_release = False
+    try:
+        import atexit  # noqa: PLC0415
+        atexit.register(_release_run_lock, run_lock_fd)
+        atexit_register_release = True
+
+        from google import genai  # noqa: PLC0415
+
+        from src import config  # noqa: PLC0415
+        from src.ingest.chunker import _get_encoder  # noqa: PLC0415
+        from src.ingest.contextualize_corpus import contextualize_file  # noqa: PLC0415
+        from src.ingest.ingest import _build_gemini_client, ingest_file  # noqa: PLC0415
+        from src.ingest.storage import _open_parents_db  # noqa: PLC0415
+        from src.milvus_client import ensure_collection, ensure_partition  # noqa: PLC0415
+        from src.pdf_parsers import mineru_daemon  # noqa: PLC0415
+        from src.pdf_parsers.mineru import parse_pdf  # noqa: PLC0415
+
+        config.validate_api_key()
+        ensure_collection(args.collection)
+        ensure_partition(args.collection, args.notebook)
+        gemini_client: genai.Client = _build_gemini_client()
+        enc = _get_encoder()
+        db_conn = _open_parents_db()
+
+        # Start the MinerU pipeline daemon up-front if any PDF needs parsing.
+        # parse_pipeline_only now requires the daemon (the CLI-subprocess fall-
+        # back was removed because it bypassed the gpu-broker's claim and OOM'd
+        # whenever the reranker held VRAM). Acquire of the broker claim happens
+        # inside start_pipeline_daemon and blocks until a higher-priority holder
+        # (e.g. the reranker) releases.
+        needs_mineru = any(
+            (d / "source.pdf").exists() and not (d / "content_list.json").exists()
+            for d in fetched_dirs
+        )
+        mineru_started = False
+        if needs_mineru:
+            try:
+                mineru_daemon.start_pipeline_daemon()
+                mineru_started = True
+            except Exception as exc:
+                print(f"REFUSING TO RUN: cannot start MinerU daemon: "
+                      f"{type(exc).__name__}: {exc}")
+                db_conn.close()
+                return 2
+
+        try:
+            n_ok = 0
+            n_skip = 0
+            n_fail = 0
+            for i, doc_dir in enumerate(fetched_dirs, 1):
+                print(f"\n[{i}/{len(fetched_dirs)}] {doc_dir.name}")
+
+                pdf = doc_dir / "source.pdf"
+                sidecar = doc_dir / "content_list.json"
+                if pdf.exists() and not sidecar.exists():
+                    print(f"  parse: MinerU on {pdf.name}")
+                    try:
+                        parse_pdf(pdf)
+                    except Exception as exc:
+                        print(f"  parse FAIL: {type(exc).__name__}: {exc}")
+                        n_fail += 1
+                        continue
+
+                for txt_name in ("nlm.txt", "pdf.txt", "web.txt"):
+                    txt = doc_dir / txt_name
+                    ctx = doc_dir / f"{txt_name}.ctx.json"
+                    if txt.exists() and not ctx.exists():
+                        try:
+                            contextualize_file(txt)
+                        except Exception as exc:
+                            print(f"  contextualize {txt_name} FAIL: {type(exc).__name__}: {exc}")
+
+                if not sidecar.exists():
+                    print("  no content_list.json — skip ingest")
+                    n_skip += 1
+                    continue
+
+                try:
+                    result = ingest_file(
+                        path=sidecar,
+                        notebook=args.notebook,
+                        collection=args.collection,
+                        gemini_client=gemini_client,
+                        db_conn=db_conn,
+                        enc=enc,
+                    )
+                    if result.get("skipped"):
+                        print(f"  ingest skipped: {result.get('reason')}")
+                        n_skip += 1
+                    else:
+                        print(f"  ingest done: {result.get('n_parents')} parents, "
+                              f"{result.get('n_children')} children")
+                        n_ok += 1
+                except Exception as exc:
+                    print(f"  ingest FAIL: {type(exc).__name__}: {exc}")
+                    n_fail += 1
+        finally:
+            db_conn.close()
+            if mineru_started:
+                try:
+                    mineru_daemon.stop_pipeline_daemon()
+                except Exception as exc:
+                    print(f"warning: stop_pipeline_daemon raised: "
+                          f"{type(exc).__name__}: {exc}")
+
+        print(f"\n=== ingest-urls done: {n_ok} ingested, {n_skip} skipped, {n_fail} failed ===")
+        return 0 if n_fail == 0 else 1
+    finally:
+        if not atexit_register_release:
+            _release_run_lock(run_lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# run — pipelined per-collection orchestrator
+# ---------------------------------------------------------------------------
+def cmd_run(args: argparse.Namespace) -> int:
+    """Thin shim over src.pipeline.runner.run_pipeline().
+
+    Stage 1 (fetch) requires ``--notebooks <UUID>+``; sources land in
+    ``sources/<collection>/<slug>/``. Stage 2 (parse → audit → contextualize →
+    ingest) iterates over the existing archive when ``--notebooks`` is omitted.
+    """
+    notebooks: list[dict[str, str]] = []
+    if args.notebooks:
+        if "fetch" not in (args.stages or orchestrate.ALL_STAGES) and args.stages:
+            print("--notebooks is only meaningful when fetch is in --stages",
+                  file=sys.stderr)
+            return 2
+        for nb_id in args.notebooks:
+            notebooks.append({"id": nb_id, "collection": args.collection})
+    else:
+        # Parse-only / audit-only / ingest-only: one entry per collection so
+        # the runner's per-collection bookkeeping has at least one row.
+        notebooks.append({"id": "", "collection": args.collection})
+
+    stages = orchestrate.select_stages(args)
+
+    if args.notebooks is None and "fetch" in stages:
+        # No UUIDs provided but fetch was selected — drop fetch silently so
+        # `ragctl run --collection trading` is a parse+audit+contextualize+ingest
+        # over the existing archive without needing --skip-stages fetch.
+        stages = [s for s in stages if s != "fetch"]
+
+    from src.pipeline.runner import run_pipeline  # noqa: PLC0415
+
+    parse_workers = args.parse_workers if hasattr(args, "parse_workers") else None
+    return run_pipeline(
+        notebooks,
+        stages,
+        root=ROOT,
+        parallel=args.parallel,
+        parse_workers=parse_workers,
+        no_cffi=args.no_cffi,
+        dry_run=args.dry_run,
+        retry_failed=getattr(args, "retry_failed", False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# notebooks — list known NotebookLM IDs from CLAUDE.md table
+# ---------------------------------------------------------------------------
+def cmd_pipeline_status(args: argparse.Namespace) -> int:
+    """Show latest stage event per slug from pipeline_status.jsonl."""
+    from src.pipeline.pipeline_log import latest_per_slug, read_status_lines  # noqa: PLC0415
+
+    if args.history:
+        # Print full history of recent events (newest first), capped.
+        events = read_status_lines(limit=args.history)
+        if args.json:
+            _emit({"events": events}, True)
+        else:
+            if not events:
+                print("(no pipeline events yet)")
+                return 0
+            print(f"{'ts':<20} {'slug':<32} {'stage':<14} {'action':<6} {'ok':>4} {'fail':>4} {'elapsed':>9}")
+            for e in events:
+                ts = e.get("ts", "")[:19]
+                slug = e.get("slug", "?")[:32]
+                stage = e.get("stage", "?")[:14]
+                action = e.get("action", "?")[:6]
+                n_ok = e.get("n_ok", 0)
+                n_fail = e.get("n_fail", 0)
+                el = e.get("elapsed_s", 0)
+                print(f"{ts:<20} {slug:<32} {stage:<14} {action:<6} {n_ok:>4} {n_fail:>4} {el:>8.1f}s")
+        return 0
+
+    latest = latest_per_slug()
+    if args.json:
+        _emit({"slugs": latest}, True)
+    else:
+        if not latest:
+            print("(no pipeline events yet)")
+            return 0
+        print(f"{'slug':<32} {'stage':<14} {'action':<6} {'ok':>4} {'fail':>4} {'elapsed':>9}  ts")
+        for slug, e in sorted(latest.items()):
+            stage = e.get("stage", "?")[:14]
+            action = e.get("action", "?")[:6]
+            n_ok = e.get("n_ok", 0)
+            n_fail = e.get("n_fail", 0)
+            el = e.get("elapsed_s", 0)
+            ts = e.get("ts", "")[:19]
+            print(f"{slug:<32} {stage:<14} {action:<6} {n_ok:>4} {n_fail:>4} {el:>8.1f}s  {ts}")
+    return 0
+
+
+def cmd_pipeline_tail(args: argparse.Namespace) -> int:
+    """Follow per-stage JSONL files for a slug live (like tail -F)."""
+
+    from src.pipeline.pipeline_log import LOGS_DIR, STAGES, stage_log_path  # noqa: PLC0415
+
+    slug = args.slug
+    stages = [args.stage] if args.stage else list(STAGES)
+    paths = [stage_log_path(slug, s) for s in stages]
+    paths = [p for p in paths if p.exists()] if not args.wait else paths
+
+    if not paths:
+        print(f"No log files found for slug={slug!r}. Existing logs in {LOGS_DIR}:")
+        for p in sorted(LOGS_DIR.glob(f"{slug}_*.jsonl")):
+            print(f"  {p.name}")
+        return 1
+
+    # Open all at end of file; tail forever.
+    handles = {}
+    for p in paths:
+        if p.exists():
+            f = p.open("r", encoding="utf-8")
+            f.seek(0, 2)  # end
+            handles[p] = f
+
+    print(f"Tailing {len(handles)} log file(s) for slug={slug!r}. Ctrl-C to stop.")
+    try:
+        while True:
+            had_any = False
+            # Pick up new files matching the slug (when --wait is set)
+            if args.wait:
+                for p in paths:
+                    if p not in handles and p.exists():
+                        f = p.open("r", encoding="utf-8")
+                        handles[p] = f  # start from beginning for newly-appearing files
+            for p, f in list(handles.items()):
+                line = f.readline()
+                while line:
+                    had_any = True
+                    line = line.rstrip("\n")
+                    try:
+                        rec = json.loads(line)
+                        item = rec.get("item", "?")
+                        status = rec.get("status", "?")
+                        stage = rec.get("stage", p.stem.split("_", 1)[1] if "_" in p.stem else "?")
+                        el = rec.get("elapsed_s", "")
+                        el_str = f" ({el}s)" if el != "" else ""
+                        extra = ""
+                        if status == "fail":
+                            extra = f"  reason={rec.get('reason', '?')}"
+                        print(f"  [{stage:<14}] {status:<5} {item}{el_str}{extra}", flush=True)
+                    except json.JSONDecodeError:
+                        print(f"  [{p.name}] {line}")
+                    line = f.readline()
+            if not had_any:
+                time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n(stopped)")
+        return 0
+
+
+def cmd_metadata_backfill(args: argparse.Namespace) -> int:
+    """Run rule-based metadata extraction across all sources."""
+    cmd = ["uv", "run", "python", "-m", "src.fetch.metadata", "--all"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    return _run(cmd).returncode
+
+
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ragctl", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("help", help="comprehensive system guide (LLM-friendly with --json)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_help)
+
+    s = sub.add_parser("status", help="corpus + Milvus snapshot")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("audit", help="filename + dedup audits + build cleanup manifest")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_audit)
+
+    s = sub.add_parser("apply", help="apply cleanup manifest (move to _quarantine_*/)")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("query", help="run a query (proxy to bin/rag)")
+    s.add_argument("query")
+    s.add_argument("--notebook", default=None)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_query)
+
+    s = sub.add_parser("ingest-deep-research",
+                       help="stage + ingest a NotebookLM Deep Research brief (Phase 2.7)")
+    s.add_argument("brief", help="path to the brief markdown file")
+    s.add_argument("--query", required=True,
+                   help="the original Deep Research question")
+    s.add_argument("--notebook", default="research_briefs",
+                   help="partition tag (default: research_briefs)")
+    s.add_argument("--collection", default="trading",
+                   help="Milvus collection (default: trading)")
+    s.set_defaults(func=cmd_ingest_deep_research)
+
+    s = sub.add_parser("discover",
+                       help="discover sources via NotebookLM Deep Research, "
+                            "fetch + ingest, then delete the notebook")
+    s.add_argument("--query", required=True,
+                   help="the Deep Research question to send to NotebookLM")
+    s.add_argument("--collection", required=True,
+                   choices=("trading", "ecology", "notes", "system", "security"),
+                   help="Milvus collection that gets the new chunks")
+    s.add_argument("--mode", default="deep", choices=("fast", "deep"),
+                   help="NotebookLM search mode (default: deep)")
+    s.add_argument("--timeout", type=int, default=1800,
+                   help="seconds to wait for research to finish (default: 1800)")
+    s.add_argument("--keep", action="store_true",
+                   help="don't delete the NotebookLM notebook on success")
+    s.set_defaults(func=cmd_discover)
+
+    s = sub.add_parser("metadata-backfill",
+                       help="run rule-based metadata extraction across all sources "
+                       "(arxiv_id, doi, authors, quality counts)")
+    s.add_argument("--dry-run", action="store_true", help="print what would change, don't write")
+    s.set_defaults(func=cmd_metadata_backfill)
+
+    s = sub.add_parser(
+        "ingest-urls",
+        help="fetch + ingest a hand-curated URL list (non-NotebookLM path)",
+    )
+    s.add_argument("urls", type=Path,
+                   help="File with one URL per line. `title || url` form supported.")
+    s.add_argument("--collection", required=True,
+                   choices=orchestrate.VALID_COLLECTIONS,
+                   help="target collection root under sources/. Required.")
+    s.add_argument("--notebook", required=True,
+                   help="partition tag for log file naming and ingest routing.")
+    s.add_argument("--parallel", type=_positive_int, default=5,
+                   help="number of fetch workers (default: 5).")
+    s.add_argument("--parse-workers", type=_positive_int, default=None,
+                   help="number of parse workers (default: same as --parallel).")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_ingest_urls)
+
+    s = sub.add_parser(
+        "run",
+        help="full pipeline: [fetch UUIDs →] parse → audit → contextualize → ingest",
+    )
+    s.add_argument("--collection", required=True,
+                   choices=orchestrate.VALID_COLLECTIONS,
+                   help="target collection root under sources/. Required.")
+    s.add_argument("--notebooks", nargs="+", default=None,
+                   help="NotebookLM UUIDs to fetch. Stage-1 only; omit for "
+                        "parse + audit + contextualize + ingest over the existing "
+                        "archive at sources/<collection>/.")
+    s.add_argument("--stages", nargs="+", default=None,
+                   help=f"subset of {{{','.join(orchestrate.ALL_STAGES)},all}} (default: all)")
+    s.add_argument("--skip-stages", nargs="+", default=None,
+                   help="inverse of --stages (mutually exclusive)")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--parallel", type=_positive_int, default=5,
+                   help="number of fetch workers (also parse workers if --parse-workers "
+                        "not set; default: 5, must be >= 1)")
+    s.add_argument("--parse-workers", type=_positive_int, default=None,
+                   help="number of parse workers. MinerU's daemon currently limits "
+                        "concurrent inference to ~3 on this GPU. "
+                        "Setting this higher just queues at the daemon's HTTP layer.")
+    s.add_argument("--no-cffi", action="store_true",
+                   help="passed through to fetch (disables curl_cffi)")
+    s.add_argument("--retry-failed", action="store_true",
+                   help="filter to sources whose last fetch produced no ok web.txt or "
+                        "source.pdf; evicts their URL-cache entries so the spider writes fresh")
+    s.add_argument("--unbounded", action="store_true",
+                   help="skip the implicit cgroup wrap (Linux only). "
+                        "Use for CI without sudo, or to override the memory ceiling.")
+    s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("pipeline-status",
+                       help="show latest pipeline stage event per slug")
+    s.add_argument("--history", type=int, default=None,
+                   help="show N most recent events instead of latest-per-slug")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_pipeline_status)
+
+    s = sub.add_parser("pipeline-tail",
+                       help="follow per-stage JSONL files for a slug (like tail -F)")
+    s.add_argument("slug")
+    s.add_argument("--stage", choices=("fetch","parse_pipeline","parse_vlm","stage","audit",
+                                       "manifest","apply","contextualize","ingest"),
+                   default=None,
+                   help="restrict to one stage (default: all)")
+    s.add_argument("--wait", action="store_true",
+                   help="wait for files that don't exist yet (poll for creation)")
+    s.set_defaults(func=cmd_pipeline_tail)
+
+    qsub = sub.add_parser("quarantine", help="inspect/restore quarantined files").add_subparsers(
+        dest="qcmd", required=True
+    )
+    s = qsub.add_parser("list")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_quarantine_list)
+    s = qsub.add_parser("restore")
+    s.add_argument("path")
+    s.set_defaults(func=cmd_quarantine_restore)
+    s = qsub.add_parser("show", help="show sidecar for one crasher quarantine")
+    s.add_argument("collection")
+    s.add_argument("slug")
+    s.set_defaults(func=cmd_quarantine_show)
+    s = qsub.add_parser(
+        "unquarantine",
+        help="move a crasher-quarantined slug back to active sources",
+    )
+    s.add_argument("collection")
+    s.add_argument("slug")
+    s.set_defaults(func=cmd_quarantine_unquarantine)
+
+    return p
+
+
+def main() -> int:
+    _maybe_reexec_bounded(sys.argv)
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
