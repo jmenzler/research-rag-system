@@ -1,12 +1,29 @@
 # Research RAG System
 
-Research assistant that ingests papers and web sources, answers questions with source references using hybrid retrieval, and maps citation graphs from Semantic Scholar data. A FastAPI service serves a React web UI, and an MCP server exposes the same tools to AI agents.
+**Ask questions over a private paper collection and get answers with source references, then explore what each paper cites and who cites it.** A FastAPI service backs a React web UI, and an MCP server gives AI agents the same tools.
+
+[Overview](#overview) · [Features](#features) · [Architecture](#architecture) · [Design decisions](#design-decisions) · [Local checks](#local-checks)
 
 **Tech:** Python · FastAPI · Milvus hybrid search (dense + BM25) · cross-encoder reranking · Kùzu graph DB · React + TypeScript · Sigma.js · MCP
 
 ![Citation graph explorer: a paper's references and citers from Semantic Scholar, with the selected paper's details](docs/images/citation-graph.png)
 
-The backend combines Milvus retrieval with parent-document storage, reranking, query rewriting, and optional answer synthesis. Discovery and ingestion run through persistent queues; query audits record retrieval choices, token usage, and estimated provider costs.
+## Overview
+
+Research questions are poorly served by plain vector search: terminology varies between papers, long documents lose context when chunked, and an answer without a traceable source is not usable. This system ingests papers and web sources, retrieves with dense and BM25 evidence, reranks, and returns the source chunks or a referenced LLM answer. Separately, it traverses a Semantic Scholar citation graph (34M papers, 626M edges in the author's local build) to surface related and obscure-but-relevant work.
+
+> [!NOTE]
+> This public snapshot is source only. It excludes the research corpus, citation datasets, private deployment configuration, credentials and the GPU broker integration. There is no hosted demo, and tests use synthetic inputs and mocked services, so they do not establish retrieval quality on a real corpus.
+
+## Features
+
+- **Hybrid retrieval.** Dense and BM25 search in Milvus, fused with reciprocal rank fusion, then cross-encoder reranking.
+- **Query decomposition.** Complex questions split into sub-queries whose result lists are merged before reranking, with optional MMR for diverse evidence.
+- **Parent/child chunks.** Small chunks are embedded for matching; the larger parent text is returned for context.
+- **Query audits.** Each query records the retrieval path taken, token usage and estimated provider cost.
+- **Citation graph explorer.** Walks references, citers, co-citation and bibliographic coupling in a Kùzu graph, ranked with a recency factor and a bias toward less-cited papers.
+- **Agent access.** An MCP server forwards retrieval, discovery and ingestion tools to the same API.
+- **Persistent work queues.** Discovery and ingestion survive restarts, with progress streaming to the UI.
 
 ## Architecture
 
@@ -29,6 +46,13 @@ flowchart LR
 - **Citations** (`src/citations/`) import Semantic Scholar paper metadata into a Kùzu graph that the UI explores with Sigma.js.
 
 See [docs/architecture.md](docs/architecture.md) for component boundaries and external dependencies.
+
+## Design decisions
+
+- **One service, many clients.** The MCP server owns no corpus and forwards to the HTTP API, so agents and the browser see identical behaviour and audits.
+- **Audit what actually ran.** Optional retrievers are flag-gated and the audit records the path taken, so evaluation reflects the real pipeline instead of a configured ideal.
+- **Graph queries shaped for the engine.** Kùzu 0.11.3 uses its primary-key index only for literal equality, so walks issue one literal query per frontier node (`src/citations/_kuzu_query.py`). In the author's local build this cut the buffer pool from 24 GB to 4 GB.
+- **Missing infrastructure fails loudly.** Optional GPU parsers and rerankers raise explicit errors when their integrations are absent.
 
 ## Inspect the implementation
 
