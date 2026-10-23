@@ -1,10 +1,22 @@
+<div align="center">
+
 # Research RAG System
 
-**Ask questions over a private paper collection and get answers with source references, then explore what each paper cites and who cites it.** A FastAPI service backs a React web UI, and an MCP server gives AI agents the same tools.
+**Ask questions over a private paper collection and get answers with source references, then explore what each paper cites and who cites it.**
+
+[![CI](https://github.com/jmenzler/research-rag-system/actions/workflows/ci.yml/badge.svg)](https://github.com/jmenzler/research-rag-system/actions/workflows/ci.yml)
+![snapshot: source only](https://img.shields.io/badge/snapshot-source%20only-6e7781)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![Milvus](https://img.shields.io/badge/Milvus-00A1EA?logo=milvus&logoColor=white)
+![Kùzu: graph DB](https://img.shields.io/badge/K%C3%B9zu-graph%20DB-5c4ee5)
+![React](https://img.shields.io/badge/React-20232A?logo=react&logoColor=white)
+![MCP: server](https://img.shields.io/badge/MCP-server-111?logo=modelcontextprotocol&logoColor=white)
 
 [Overview](#overview) · [Features](#features) · [Architecture](#architecture) · [Design decisions](#design-decisions) · [Local checks](#local-checks)
 
-**Tech:** Python · FastAPI · Milvus hybrid search (dense + BM25) · cross-encoder reranking · Kùzu graph DB · React + TypeScript · Sigma.js · MCP
+</div>
+
+A FastAPI service backs a React web UI, and an MCP server gives AI agents the same tools.
 
 ## Overview
 
