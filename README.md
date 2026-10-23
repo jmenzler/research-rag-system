@@ -6,8 +6,6 @@
 
 **Tech:** Python · FastAPI · Milvus hybrid search (dense + BM25) · cross-encoder reranking · Kùzu graph DB · React + TypeScript · Sigma.js · MCP
 
-![Citation graph explorer: a paper's references and citers from Semantic Scholar, with the selected paper's details](docs/images/citation-graph.png)
-
 ## Overview
 
 Research questions are poorly served by plain vector search: terminology varies between papers, long documents lose context when chunked, and an answer without a traceable source is not usable. This system ingests papers and web sources, retrieves with dense and BM25 evidence, reranks, and returns the source chunks or a referenced LLM answer. Separately, it traverses a Semantic Scholar citation graph (34M papers, 626M edges in the author's local build) to surface related and obscure-but-relevant work.
@@ -24,6 +22,8 @@ Research questions are poorly served by plain vector search: terminology varies 
 - **Citation graph explorer.** Walks references, citers, co-citation and bibliographic coupling in a Kùzu graph, ranked with a recency factor and a bias toward less-cited papers.
 - **Agent access.** An MCP server forwards retrieval, discovery and ingestion tools to the same API.
 - **Persistent work queues.** Discovery and ingestion survive restarts, with progress streaming to the UI.
+
+![Citation graph explorer: a paper's references and citers from Semantic Scholar, with the selected paper's details](docs/images/citation-graph.png)
 
 ## Architecture
 
